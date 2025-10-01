@@ -244,6 +244,135 @@ class Svc:
         torch.cuda.empty_cache()
         return audio, audio.shape[-1]
 
+    def infer_batch(
+        self,
+        speakers: list[int | str],
+        transposes: list[int],
+        audios: list[ndarray[Any, dtype[float32]]],
+        cluster_infer_ratios: list[float] | None = None,
+        auto_predict_f0: bool = False,
+        noise_scale: float = 0.4,
+        f0_method: Literal[
+            "crepe", "crepe-tiny", "parselmouth", "dio", "harvest"
+        ] = "dio",
+    ) -> list[tuple[torch.Tensor, int]]:
+        """
+        Batch inference for multiple audio files.
+        
+        Args:
+            speakers: List of speaker IDs or names
+            transposes: List of transpose values for each audio
+            audios: List of audio arrays to process
+            cluster_infer_ratios: List of cluster inference ratios (optional)
+            auto_predict_f0: Whether to auto predict f0
+            noise_scale: Noise scale for inference
+            f0_method: F0 extraction method
+            
+        Returns:
+            List of tuples containing (audio_tensor, audio_length) for each input
+        """
+        if cluster_infer_ratios is None:
+            cluster_infer_ratios = [0.0] * len(audios)
+            
+        batch_size = len(audios)
+        if not (len(speakers) == len(transposes) == len(audios) == len(cluster_infer_ratios)):
+            raise ValueError("All input lists must have the same length")
+            
+        # Process each audio to get features
+        batch_c = []
+        batch_f0 = []
+        batch_uv = []
+        batch_sids = []
+        
+        for i, (speaker, transpose, audio, cluster_infer_ratio) in enumerate(
+            zip(speakers, transposes, audios, cluster_infer_ratios)
+        ):
+            audio = audio.astype(np.float32)
+            
+            # Get speaker id
+            if isinstance(speaker, int):
+                if len(self.spk2id.__dict__) >= speaker:
+                    speaker_id = speaker
+                else:
+                    raise ValueError(
+                        f"Speaker id {speaker} >= number of speakers {len(self.spk2id.__dict__)}"
+                    )
+            else:
+                if speaker in self.spk2id.__dict__:
+                    speaker_id = self.spk2id.__dict__[speaker]
+                else:
+                    LOG.warning(f"Speaker {speaker} is not found. Use speaker 0 instead.")
+                    speaker_id = 0
+                    
+            sid = torch.LongTensor([int(speaker_id)]).to(self.device)
+            batch_sids.append(sid)
+            
+            # Get unit f0
+            c, f0, uv = self.get_unit_f0(
+                audio, transpose, cluster_infer_ratio, speaker, f0_method
+            )
+            
+            batch_c.append(c)
+            batch_f0.append(f0)
+            batch_uv.append(uv)
+        
+        # Find maximum sequence length for padding
+        max_len = max(c.shape[2] for c in batch_c)
+        
+        # Pad sequences to same length and stack
+        padded_c = []
+        padded_f0 = []
+        padded_uv = []
+        
+        for c, f0, uv in zip(batch_c, batch_f0, batch_uv):
+            pad_len = max_len - c.shape[2]
+            if pad_len > 0:
+                c = torch.nn.functional.pad(c, (0, pad_len))
+                f0 = torch.nn.functional.pad(f0, (0, pad_len))
+                uv = torch.nn.functional.pad(uv, (0, pad_len))
+            padded_c.append(c)
+            padded_f0.append(f0)
+            padded_uv.append(uv)
+        
+        # Stack into batch tensors
+        batch_c_tensor = torch.cat(padded_c, dim=0)
+        batch_f0_tensor = torch.cat(padded_f0, dim=0)
+        batch_uv_tensor = torch.cat(padded_uv, dim=0)
+        batch_sids_tensor = torch.stack(batch_sids, dim=0)
+        
+        # Batch inference
+        with torch.no_grad():
+            with timer() as t:
+                batch_audio = self.net_g.infer(
+                    batch_c_tensor,
+                    f0=batch_f0_tensor,
+                    g=batch_sids_tensor,
+                    uv=batch_uv_tensor,
+                    predict_f0=auto_predict_f0,
+                    noice_scale=noise_scale,
+                )[:, 0].data.float()
+                
+            total_audio_duration = sum(
+                audio.shape[-1] / self.target_sample for audio in audios
+            )
+            LOG.info(
+                f"Batch inference time: {t.elapsed:.2f}s, "
+                f"Total audio duration: {total_audio_duration:.2f}s, "
+                f"RTF: {t.elapsed / total_audio_duration:.2f}, "
+                f"Batch size: {batch_size}"
+            )
+        
+        torch.cuda.empty_cache()
+        
+        # Return individual results
+        results = []
+        for i, audio_tensor in enumerate(batch_audio):
+            # Remove padding by using original audio length
+            original_length = int(audios[i].shape[-1] * (self.target_sample / self.target_sample))
+            results.append((audio_tensor, audio_tensor.shape[-1]))
+            
+        return results
+
     def infer_silence(
         self,
         audio: np.ndarray[Any, np.dtype[np.float32]],
