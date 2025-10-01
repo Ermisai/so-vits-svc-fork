@@ -367,9 +367,18 @@ class Svc:
         # Return individual results
         results = []
         for i, audio_tensor in enumerate(batch_audio):
-            # Remove padding by using original audio length
-            original_length = int(audios[i].shape[-1] * (self.target_sample / self.target_sample))
-            results.append((audio_tensor, audio_tensor.shape[-1]))
+            # Calculate expected output length based on input length and sample rates
+            # The audio tensor might be longer due to padding, so we need to crop it
+            input_duration = audios[i].shape[-1] / self.target_sample
+            expected_output_length = int(input_duration * self.target_sample)
+            
+            # Crop to expected length to remove padding artifacts
+            if audio_tensor.shape[-1] > expected_output_length:
+                cropped_audio = audio_tensor[:expected_output_length]
+            else:
+                cropped_audio = audio_tensor
+                
+            results.append((cropped_audio, cropped_audio.shape[-1]))
             
         return results
 
